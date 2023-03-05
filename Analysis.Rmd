@@ -1,0 +1,609 @@
+---
+title: "Single-cell (Seurat/SingleR)"
+author: "Petrenko Kate"
+date: "2023-02-10"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+This project aims to identify and explain the differences between the annotations of cells obtained by the Seurat and SingleR packages.
+ was chosen for analysis. Immune cells were isolated from brain tissues removed during brain surgery for the treatment of epilepsy in this investigation.
+
+```{r include=FALSE}
+CPU = 8
+datapath = 'singleR/data'
+url = 'https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE201048&format=file'
+set.seed(42)
+```
+
+```{r setup, include=FALSE}
+if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("stringr", quietly = TRUE)) install.packages('stringr')
+library(stringr)
+if (!requireNamespace("scater", quietly = TRUE)) BiocManager::install("scater")
+library(scater)
+if (!requireNamespace("scran", quietly = TRUE)) BiocManager::install("scran")
+library(scran)
+if (!requireNamespace("bluster", quietly = TRUE)) BiocManager::install("bluster")
+library(bluster)
+if (!requireNamespace("kableExtra", quietly = TRUE)) install.packages("kableExtra")
+library(kableExtra)
+if (!requireNamespace("Seurat", quietly = TRUE)) install.packages("Seurat")
+library(Seurat)
+if (!requireNamespace("ggforce", quietly = TRUE)) install.packages("ggforce")
+library(ggforce)
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+library(ggplot2)
+if (!requireNamespace("ggrepel", quietly = TRUE)) install.packages("ggrepel")
+library(ggrepel)
+if (!requireNamespace("future", quietly = TRUE)) install.packages("future")
+library(future)
+if (!requireNamespace("SingleR", quietly = TRUE)) BiocManager::install("SingleR")
+library(SingleR)
+if (!requireNamespace("celldex", quietly = TRUE)) BiocManager::install("celldex")
+library(celldex)
+if (!requireNamespace("scRNAseq", quietly = TRUE)) BiocManager::install("scRNAseq")
+library(scRNAseq)
+if (!requireNamespace("ensembldb", quietly = TRUE)) BiocManager::install("ensembldb")
+if (!requireNamespace("EnsDb.Hsapiens.v86", quietly = TRUE)) BiocManager::install("EnsDb.Hsapiens.v86")
+library(EnsDb.Hsapiens.v86)
+if (!requireNamespace("dplyr", quietly = TRUE)) BiocManager::install("dplyr")
+library(dplyr)
+library(BiocParallel)
+```
+
+```{r warning=FALSE, include=FALSE}
+# Download files
+options(timeout=500)
+dir.create(datapath)
+setwd(datapath)
+
+if(!all(file.exists(paste0(rep(paste0('Sample', 1:11, '/'), 3) %>% sort,
+       rep(c('barcodes.tsv.gz', 'features.tsv.gz', 'matrix.mtx.gz'), 11))))){
+  download.file(url, 'data.tar')
+  untar('data.tar')
+  file.remove('data.tar')
+
+
+  #Change files structure 
+  lapply(seq(1, 11, 1), function(x) {
+    dir.create(paste0('Sample', x))
+    })
+  
+  file.list <- setdiff(list.files(), list.dirs(recursive = FALSE, full.names = FALSE))
+  lapply(file.list, function(x) { 
+    pattern <- str_extract(x, 'Sample.*(?=_)')
+    name <- str_remove(x, ".*(_)")
+    file.rename(from=x, to=paste0(pattern, '/', name))
+  })
+
+}
+
+```
+
+# Seurat analysis
+
+```{r include=FALSE}
+setwd(datapath)
+
+#read data
+lapply(paste0('Sample', 1:11), function(sample){
+
+  data <- Read10X(sample)
+  CreateSeuratObject(data$`Gene Expression`, min.cells = 10, min.features = 200)
+}) %>% 
+  setNames(paste0('sample', 1:11)) %>%
+  list2env(envir = .GlobalEnv)
+
+#merge samples
+allsamples <- merge(sample1, y=c(sample2, sample3, sample4, sample5, sample6,
+                                 sample7, sample8, sample9, sample10, sample11), 
+                    add.cell.ids = c("s1", "s2", "s3", "s4", "s5", "s6",
+                                     "s7", "s8", "s9", "s10", "s11"))
+
+#create data for SingleR analysis
+allsamples_sce <- merge(sample1, y=c(sample2, sample3, sample4, sample5, sample6,
+                                 sample7, sample8, sample9, sample10, sample11), 
+                    add.cell.ids = c("s1", "s2", "s3", "s4", "s5", "s6",
+                                     "s7", "s8", "s9", "s10", "s11"))
+
+rm(list=c(paste0('sample', 1:11)))
+```
+
+## Quality control (QC)
+
+### Feature - count relationship before QC
+
+```{r echo=FALSE, out.width="100%"}
+FeatureScatter(allsamples, 'nCount_RNA', 'nFeature_RNA') +
+  scale_x_log10() +
+  scale_y_log10()
+```
+
+### Filter dying and low-quality cells
+
+Dying cells have a lot of percent of mitochondrial genes.
+
+```{r echo=FALSE, out.width="100%"}
+allsamples[['percent.mt']] <- PercentageFeatureSet(allsamples, pattern = '^MT-')
+FeatureScatter(allsamples, 'nCount_RNA', 'percent.mt') +
+  scale_x_log10()
+FeatureScatter(allsamples, 'nFeature_RNA', 'percent.mt') +
+  scale_x_log10()
+```
+
+### Feature - count relationship after QC
+
+Cell were deleted, which have:      
+
+- percent of mitochondrial genes more 20% (dying cells)    
+
+- less 300 genes (low-quality cells or empty droplets)       
+
+- more 5000 genes (cell multiplets or doublets)
+
+After quality control, a total of 85,066 cells and 19,774 genes were retained for further analysis.
+
+```{r echo=FALSE, out.width="100%"}
+allsamples <- subset(allsamples, subset = nFeature_RNA > 300 & nFeature_RNA < 5000 & percent.mt < 20)
+FeatureScatter(allsamples, 'nCount_RNA', 'nFeature_RNA') +
+  scale_x_log10() +
+  scale_y_log10()
+```
+
+## Feature selection
+
+```{r include=FALSE}
+plan("multisession", workers = CPU)
+allsamples <- NormalizeData(allsamples)
+```
+
+For further analysis, two thousand highly variable genes were selected, for which the data were preliminarily normalized using method "LogNormalize".
+
+```{r echo=FALSE, message=FALSE, out.width="100%"}
+plan("multisession", workers = CPU)
+allsamples <- FindVariableFeatures(allsamples, nfeatures = 2000)
+
+LabelPoints(plot = VariableFeaturePlot(allsamples), 
+            points = head(VariableFeatures(allsamples), 10), 
+            repel = TRUE)
+```
+
+## PCA
+
+PCA was used as dimensionality reduction technique. Before PCA data was scaled.
+
+```{r include=FALSE}
+plan("multisession", workers = CPU)
+all.genes <- rownames(allsamples)
+allsamples <- ScaleData(allsamples, features = all.genes)
+allsamples <- RunPCA(allsamples, features = VariableFeatures(object = allsamples))
+```
+
+```{r echo=FALSE, out.width="100%"}
+DimHeatmap(allsamples, dims = 1:9, cells = 500, balanced = TRUE)
+DimHeatmap(allsamples, dims = 10:18, cells = 500, balanced = TRUE)
+DimHeatmap(allsamples, dims = 19:27, cells = 500, balanced = TRUE)
+```
+
+### Dimensionality definition
+
+Based on the results of JackStrawPlot, ElbowPlot and DimHeatmap were selected 1-20 PCs were selected for clustering.
+
+```{r echo=FALSE, fig.height=8, fig.width=12, warning=FALSE, out.width="100%"}
+plan("multisession", workers = CPU)
+allsamples <- JackStraw(allsamples, num.replicate = 100, dims=50)
+allsamples <- ScoreJackStraw(allsamples, dims = 1:50)
+JackStrawPlot(allsamples, dims = 1:50) +
+  theme(legend.position="bottom")
+```
+
+```{r echo=FALSE}
+ElbowPlot(allsamples, ndims = 50)
+```
+
+## Clustering
+
+Dataset was clustered using KNN-graph approach. Clustering was performed with a resolution of 0.1 to 1 in increments of 0.1. An annotation was performed after each iteration, resulting in the best value of the resolution parameter of 0.5. Clusters were visualized by tSNE.
+
+```{r echo=FALSE, fig.height=4.4, fig.width=7, out.width="100%", message=FALSE, warning=FALSE}
+plan("multisession", workers = CPU)
+allsamples <- FindNeighbors(allsamples, dims = 1:20)
+allsamples <- FindClusters(allsamples, resolution = 0.5, verbose = FALSE)
+allsamples <- RunTSNE(allsamples, dims = 1:20)
+DimPlot(allsamples, reduction = "tsne", label = TRUE)
+```
+
+## Cluster biomarkers
+
+Biomarkers were found using next parameters:  
+
+- the feature must be detected at 25% of cells in either of the two groups of cells 
+
+- only positive
+
+```{r  include=FALSE}
+plan("multisession", workers = CPU)
+allsamples.markers <- FindAllMarkers(allsamples, only.pos = TRUE, 
+                                     min.pct = 0.25, logfc.threshold = 0.25,
+                                     verbose = FALSE)
+allsamples.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 5, order_by = avg_log2FC)
+```
+
+Firstly, markers from each clusters were analysed using [database](https://panglaodb.se) to make assumptions about the cell type. Then cell clusters were annotated using established marker genes.
+
+### Markers of microglia
+
+Microglia are the primary immune cells of the CNS, and are highly similar to peripheral macrophages.
+
+Clusters - 0, 1, 2, 3, 4, 6, 7, 8, 10 - can be annotated as microglia
+
+```{r echo=FALSE, fig.height=12, fig.width=12, out.width="100%"}
+FeaturePlot(allsamples, features = c('AIF1', 'C1QA', 'CSF1R', 'C1QB', 'C1QC', 'CX3CR1'))
+```
+
+### T-cells marker
+
+Cluster - 5 - can be annotated as T-cells.
+
+```{r echo=FALSE, out.width="100%"}
+FeaturePlot(allsamples, features = c('CD3D'))
+```
+
+### NK-cells markers
+
+Cluster - 12 - can be annotated as NK-cells.
+
+```{r echo=FALSE, fig.height=8, fig.width=12, out.width="100%"}
+FeaturePlot(allsamples, features = c('NKG7', 'GZMA', 'GNLY'))
+```
+
+### B-cells markers
+
+Cluster - 14 - can be annotated as B-cells.
+
+```{r echo=FALSE, out.width="100%"}
+FeaturePlot(allsamples, features = c('CD79A'))
+```
+
+### Oligodendrocytes markers
+
+Cluster - 13 - can be annotated as Oligodendrocytes.
+
+```{r echo=FALSE, fig.height=4, fig.width=12, out.width="100%"}
+FeaturePlot(allsamples, features = c('MOG', 'MAG'))
+```
+
+### Fibroblasts markers
+
+Cluster - 9, 15, 17 - can be annotated as Fibroblasts.
+
+```{r echo=FALSE, out.width="100%"}
+FeaturePlot(allsamples, features = c('COL6A2'))
+```
+
+### Endothelial cells markers
+
+Cluster - 16 - can be annotated as Endothelial cells
+
+```{r echo=FALSE, fig.height=4, fig.width=12, out.width="100%"}
+FeaturePlot(allsamples, features = c('VWF', 'CDH5'))
+```
+
+### Dendritic cells markers
+
+Cluster - 11 - can be annotated as Dendritic cells
+
+```{r echo=FALSE, out.width="100%"}
+FeaturePlot(allsamples, features = c('S100A9'))
+```
+
+### Cell types
+
+**Seurat annotation result:**
+
+```{r echo=FALSE, out.width="100%"}
+# Rename clusters
+new.cluster.ids <- c("Microglia", "Microglia", "Microglia", "Microglia", "Microglia", "T cells",
+                     "Microglia", "Microglia", "Microglia", "Fibroblasts", "Microglia",  "Dendritic cells",
+                     "NK cells", "Oligodendrocytes", "B cells", "Fibroblasts",  "Endothelial cells", "Fibroblasts")
+names(new.cluster.ids) <- levels(allsamples)
+allsamples <- RenameIdents(allsamples, new.cluster.ids)
+allsamples$manual_cell_type <- Idents(allsamples)
+  
+DimPlot(allsamples, reduction = "tsne",
+        pt.size = 0.4, label = TRUE, repel = TRUE, label.size = 4) +
+  labs(title = 'Manual annotation of Seurat cluster') +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  NoLegend() 
+```
+
+# SingleR
+
+Preprocessing data was the same.
+
+```{r include=FALSE}
+#filter dying, low-quality cells and empty droplets or multiptets
+allsamples_sce[['percent.mt']] <- PercentageFeatureSet(allsamples_sce, pattern = '^MT-')
+allsamples_sce <- subset(allsamples_sce, subset = nFeature_RNA > 300 & nFeature_RNA < 5000 & percent.mt < 20)
+
+#transform to format SingleCellExperiment
+allsamples_sce <- as.SingleCellExperiment(allsamples_sce)
+
+#change gene name to symbol 
+ens <- mapIds(EnsDb.Hsapiens.v86,
+  keys = rownames(allsamples_sce),
+  column = 'GENEID',
+  keytype = 'SYMBOL')
+all(rownames(allsamples_sce) == names(ens))
+
+#delete gene without name
+keep <- !is.na(ens)
+ens <- ens[keep]
+allsamples_sce <- allsamples_sce[keep,]
+rownames(allsamples_sce) <- ens
+
+#Normalization
+allsamples_sce <- logNormCounts(allsamples_sce)
+```
+
+```{r include=FALSE}
+#get references
+ref.data <- HumanPrimaryCellAtlasData(ensembl=TRUE)
+ref.brain <- DarmanisBrainData(ensembl=TRUE)
+ref.brain <- logNormCounts(ref.brain)
+```
+
+## Annotation each cell
+
+### Reference - HumanPrimaryCellAtlasData
+
+The Human Primary Cell Atlas was chosen as the reference. Because most of the labels refer to blood subpopulations, but cell types from other tissues are also available. Our samples are isolated immune cells, but from the brain, so there may be other cell types available here.
+
+```{r echo=FALSE}
+#prediction
+predictions_ind_hum <- SingleR(allsamples_sce, 
+                               ref=ref.data, labels=ref.data$label.main,
+                               de.method='wilcox', de.n=25,
+                               BPPARAM=MulticoreParam(CPU))
+
+#prediction table
+predictions_ind_hum_table <- sort(table(predictions_ind_hum$labels), 
+                                  decreasing=TRUE) %>% 
+  as.data.frame(responseName = "Count") %>% 
+  tibble::column_to_rownames(var="Var1")
+```
+
+Results are shown that our samples have a lot of unexpected cell types. For example, hepatocytes, erythroblast etc.
+
+The manual annotation contained many cells belonging to microglia. The reason we do not see the same result here is that the reference we selected does not contain information about this cell type, as well as many other brain cells. However, the use of this reference is still important for the evaluation of immune cells, since datasets containing brain cells usually do not contain their.
+
+**Annotation diagnostic:**
+
+Heatmap of the assignment scores
+
+```{r echo=FALSE, fig.height=10, fig.width=8, out.width="100%"}
+plotScoreHeatmap(predictions_ind_hum)
+```
+
+### Reference - Darmanis brain data
+
+The Darmanis brain data were chosen as a reference to brain cells that were not presented in the previous data.
+
+```{r echo=FALSE}
+#prediction
+predictions_ind_brain <- SingleR(allsamples_sce, ref=ref.brain,
+                                 labels=ref.brain$cell.type,
+                                 de.method='wilcox', de.n=25,
+                                 BPPARAM=MulticoreParam(CPU))
+
+#prediction table
+predictions_ind_brain_table <- sort(table(predictions_ind_brain$labels), 
+                                  decreasing=TRUE) %>% 
+  as.data.frame(responseName = "Count") %>% 
+  tibble::column_to_rownames(var="Var1")
+
+```
+
+Results is only 6 type of cells but we can see that a lot of cells was annotated as microglia what is more likely to be true. But we can't analyse immune cells.
+
+**Annotation diagnostic:**
+
+Heatmap of the assignment scores
+
+```{r echo=FALSE, fig.height=10, fig.width=8, out.width="100%"}
+plotScoreHeatmap(predictions_ind_brain)
+```
+
+### Reference - DarmanisBrainData and HumanPrimaryCellAtlasData
+
+It was decided to combine the two references to solve problem with annotation.
+
+```{r echo=FALSE}
+predictions_doubleref <- SingleR(allsamples_sce, 
+                     ref = list(brain=ref.brain, humatl=ref.data), 
+                     labels = list(ref.brain$cell.type, ref.data$label.main),
+                     de.method='wilcox', de.n=25,
+                     BPPARAM=MulticoreParam(CPU))
+```
+
+**Annotation diagnostic:**
+
+Heatmap of the assignment scores
+
+```{r echo=FALSE, fig.height=22, fig.width=8, out.width="100%"}
+plotScoreHeatmap(predictions_doubleref)
+```
+
+### Comparison of annotations
+
+Here I compare annotations obtained with SingleR and annotations made manually.
+
+```{r include=FALSE}
+#create custom palette for plots
+custom_colors <- list()
+
+colors_dutch <- c('#FFC312','#C4E538','#12CBC4','#FDA7DF','#ED4C67',
+                  '#F79F1F','#A3CB38','#1289A7','#D980FA','#B53471',
+                  '#EE5A24','#009432','#0652DD','#9980FA','#833471',
+                  '#EA2027','#006266','#1B1464','#5758BB','#6F1E51')
+
+colors_spanish <- c('#40407a','#706fd3','#f7f1e3','#34ace0','#33d9b2',
+                    '#2c2c54','#474787','#aaa69d','#227093','#218c74',
+                    '#ff5252','#ff793f','#d1ccc0','#ffb142','#ffda79',
+                    '#b33939','#cd6133','#84817a','#cc8e35','#ccae62')
+
+custom_colors$discrete <- c(colors_dutch, colors_spanish)
+
+custom_colors$cell_cycle <- setNames(c('#45aaf2', '#f1c40f', '#e74c3c', '#7f8c8d'),
+                                     c('G1',      'S',       'G2M',     '-'))
+```
+
+```{r echo=FALSE, fig.height=10, fig.width=8, out.width="100%"}
+#data processing for plot
+allsamples$cell_type_singler_ind <- predictions_doubleref$labels
+clusters <- levels(allsamples$seurat_clusters)
+cell_types <- sort(unique(allsamples$cell_type_singler_ind))
+
+color_assignments <- setNames(
+  c(custom_colors$discrete[1:length(clusters)], custom_colors$discrete[1:length(cell_types)]),
+  c(clusters,cell_types))
+
+data <- allsamples@meta.data %>%
+  dplyr::rename(cell_type = cell_type_singler_ind) %>%
+  dplyr::mutate(cell_type = factor(cell_type, levels = cell_types)) %>%
+  group_by(seurat_clusters, cell_type) %>%
+  tally() %>%
+  ungroup() %>%
+  gather_set_data(1:2) %>%
+  dplyr::mutate(x = factor(x, levels = unique(x)),
+                y = factor(y, levels = c(clusters,cell_types)))
+
+data_labels <- tibble(
+    group = c(rep('seurat_clusters', length(clusters)),
+              rep('cell_type', length(cell_types)))
+    ) %>%
+  mutate(
+    hjust = ifelse(group == 'seurat_clusters', 1, 0),
+    nudge_x = ifelse(group == 'seurat_clusters', -0.1, 0.1))
+
+#plot
+p_SingleR <- ggplot(data, aes(x, id = id, split = y, value = n)) +
+  geom_parallel_sets(aes(fill = seurat_clusters), alpha = 0.75, axis.width = 0.15) +
+  geom_parallel_sets_axes(aes(fill = y), color = 'black', axis.width = 0.1) +
+  geom_text(aes(y = n, split = y), stat = 'parallel_sets_axes', 
+            hjust = data_labels$hjust, nudge_x = data_labels$nudge_x) +
+  scale_x_discrete(labels = c('Cluster','Cell type')) +
+  scale_fill_manual(values = color_assignments) +
+  labs(title = 'SingleR annotation') +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 18, face = 'bold'),
+        legend.position = 'none',
+        axis.title = element_blank(),
+        axis.text.x = element_text(colour = 'black', size = 15),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        panel.border = element_blank())
+p_SingleR 
+```
+
+```{r echo=FALSE, fig.height=8, fig.width=8, out.width="100%"}
+#data processing for plot
+cell_types <- sort(unique(as.character(allsamples$manual_cell_type)))
+
+color_assignments <- setNames(
+  c(custom_colors$discrete[1:length(clusters)], custom_colors$discrete[1:length(cell_types)]),
+  c(clusters,cell_types))
+
+data <- allsamples@meta.data %>%
+  dplyr::rename(cell_type = manual_cell_type) %>%
+  dplyr::mutate(cell_type = factor(cell_type, levels = cell_types)) %>%
+  group_by(seurat_clusters, cell_type) %>%
+  tally() %>%
+  ungroup() %>%
+  gather_set_data(1:2) %>%
+  dplyr::mutate(x = factor(x, levels = unique(x)),
+                y = factor(y, levels = c(clusters,cell_types)))
+
+data_labels <- tibble(
+    group = c(rep('seurat_clusters', length(clusters)),
+              rep('cell_type', length(cell_types)))
+    ) %>%
+  mutate(
+    hjust = ifelse(group == 'seurat_clusters', 1, 0),
+    nudge_x = ifelse(group == 'seurat_clusters', -0.1, 0.1))
+
+#plot
+p_SingleR <- ggplot(data, aes(x, id = id, split = y, value = n)) +
+  geom_parallel_sets(aes(fill = seurat_clusters), alpha = 0.75, axis.width = 0.15) +
+  geom_parallel_sets_axes(aes(fill = y), color = 'black', axis.width = 0.1) +
+  geom_text(aes(y = n, split = y), stat = 'parallel_sets_axes',
+            hjust = data_labels$hjust, nudge_x = data_labels$nudge_x) +
+  scale_x_discrete(labels = c('Cluster','Cell type')) +
+  scale_fill_manual(values = color_assignments) +
+  labs(title = 'Manual annotation') +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 18, face = 'bold'),
+        legend.position = 'none',
+        axis.title = element_blank(),
+        axis.text.x = element_text(colour = 'black', size = 15),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        panel.border = element_blank())
+p_SingleR 
+```
+
+In general, clusters consisting of many cells are annotated in the same way. However, in some cases SingleR refers parts of the cells to a different type, which is caused by the fact that the annotation is performed for each individual cell independently. I speculate that this difference might be smaller if the parameters for clustering in Seurat were chosen more optimally. Insufficient clustering may have resulted in not enough resolution to identify rare cell types.
+
+It is worth noting that the difference between annotations of small clusters is more significant. I think this can be explained by the fact that manual annotation often uses established marker genes. First, the choice of markers is subjective, because, as a rule, not all possible markers are checked, but those that are of interest to the researcher. Second, the very assessment of the expression of these markers is also subjective. In turn, SingleR uses correlation analysis only for variable genes and compares the expression profile with the reference. In my opinion, the main advantages of this method are that it is more accurate and less subjective.
+
+## Cluster annotation
+
+### Reference - DarmanisBrainData and HumanPrimaryCellAtlasData
+
+SingleR provides the ability to annotate clusters at once.
+
+Data from two references were taken as a reference, since this showed the most meaningful biological results in the annotation of individual cells.
+
+
+
+```{r echo=FALSE, fig.height=4, fig.width=6, out.width="100%"}
+#prediction
+predictions_clusters_doubleref <- SingleR(allsamples_sce,
+                     ref = list(brain=ref.brain, humatl=ref.data), 
+                     labels = list(ref.brain$cell.type, ref.data$label.main), 
+                     clusters=Idents(allsamples), 
+                     de.method='wilcox', de.n=25, BPPARAM=MulticoreParam(CPU))
+
+new.cluster.ids <- predictions_clusters_doubleref$labels
+names(new.cluster.ids) <- levels(allsamples)
+allsamples <- RenameIdents(allsamples, new.cluster.ids)
+
+#plot
+DimPlot(allsamples, reduction = "tsne",
+        pt.size = 0.4, label = TRUE, repel = TRUE, label.size = 3) +
+  labs(title = 'SingleR annotation based Seurat cluster',
+       subtitle = 'Reference: Human Primary Cell Atlas, \n Darmanis brain data') +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5)) +
+  NoLegend() 
+```
+
+**Annotation diagnostic:**
+
+Heatmap of the assignment scores
+
+```{r echo=FALSE, fig.height=22, fig.width=8, out.width="100%"}
+plotScoreHeatmap(predictions_clusters_doubleref)
+```
+
+# Conclusion
+
+An independent annotation of each cell provides more information, as it allows you to identify transient types and rare cell types. However, the quality of the annotation will strongly depend on the reference you choose. In addition, it is not possible to identify a new cell type because it will not be in the reference. As for manual annotation, it is a creative process. Its quality is largely up to you. However, it takes a lot of time and, unfortunately, is usually subjective.
